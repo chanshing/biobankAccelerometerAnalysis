@@ -13,6 +13,9 @@ import pandas as pd
 import atexit
 import warnings
 
+#!npyproc
+from accelerometer import npyproc
+
 
 def main():
     """
@@ -233,8 +236,14 @@ def main():
                             subprocesses,useful for limiting RAM usage (default
                             : unlimited)""")
 
+    #!npyproc
+    parser.add_argument('--npyproc', type=str2bool, default=False)
 
     args = parser.parse_args()
+
+    #!npyproc
+    if args.npyproc:
+        args.npyOutput = True
 
     assert args.sampleRate >= 25, "sampleRate<25 currently not supported"
 
@@ -347,6 +356,11 @@ def main():
             csvTimeXYZColsIndex=args.csvTimeXYZColsIndex)
     else:
         summary['file-name'] = args.epochFile
+
+    #!npyproc
+    if args.npyproc:
+        npyproc.process(args.npyFile+'.gz', impute=False, detect_nonwear=True, outfile=args.npyFile.replace('.npy', '_MAD.npy'))
+        os.remove(args.npyFile+'.gz')
 
     # Summarise epoch
     epochData, labels = accelerometer.summariseEpoch.getActivitySummary(
