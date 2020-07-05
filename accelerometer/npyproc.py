@@ -16,6 +16,9 @@ import blosc
 from numba import jit, guvectorize
 import jpype
 import jpype.imports
+import catch22
+from catch22 import catch22_all
+from tqdm.auto import tqdm
 
 # in centiseconds
 SEC = 100
@@ -49,21 +52,78 @@ class Extractor():
     It starts a Java Virtual Machine, instantiates FeatureExtractor, and
     implements 'extract' method to handle numpy arrays.
     '''
-    def __init__(self):
-        # start Java Virtual Machine and instantiate FeatureExtractor
+    def __init__(self, basic=True, sanDiego=True, mad=True, unilever=True, fft3d=True):
+        Extractor.start()
+        self.java_extractor = jpype.JClass('FeatureExtractor')
+        self.basic = basic
+        self.sanDiego = sanDiego
+        self.mad = mad
+        self.unilever = unilever
+        self.fft3d = fft3d
+
+    def extract(self, xyz):
+        xyz = xyz.astype('f8')
+        xArray, yArray, zArray = xyz.T
+        xArray = jpype.JArray(jpype.JDouble, 1)(xArray)
+        yArray = jpype.JArray(jpype.JDouble, 1)(yArray)
+        zArray = jpype.JArray(jpype.JDouble, 1)(zArray)
+        return np.asarray(self.java_extractor.extract(
+            xArray, yArray, zArray, DEVICE_SAMPLE_HZ,
+            self.basic, self.sanDiego, self.mad, self.unilever, self.fft3d
+        ))
+
+    @staticmethod
+    def shutdown():
+    # Shut down Java Virtual Machine
+        jpype.shutdownJVM()
+
+    @staticmethod
+    def start():
+    # Start Java Virtual Machine
         if not jpype.isJVMStarted():
             jpype.addClassPath("java_feature_extractor")
             jpype.addClassPath("java_feature_extractor/JTransforms-3.1-with-dependencies.jar")
-            jpype.startJVM(convertStrings=False)
-        self.java_extractor = jpype.JClass('FeatureExtractor')
+            jpype.startJVM("-XX:ParallelGCThreads=1", convertStrings=False)
 
-    def extract(self, xyz):
-        xArray, yArray, zArray = xyz
-        xArray = jpype.JArray(jpype.JFloat, 1)(xArray)
-        yArray = jpype.JArray(jpype.JFloat, 1)(yArray)
-        zArray = jpype.JArray(jpype.JFloat, 1)(zArray)
-        return np.asarray(self.java_extractor.extract(
-            xArray, yArray, zArray, DEVICE_SAMPLE_HZ))
+
+# def quantile_features(xyz):
+#     q = np.arange(.1, 1, .1)
+#     v = np.linalg.norm(xyz, axis=1)
+#     vxy = np.linalg.norm(xyz[:,[0,1]], axis=1)
+#     vyz = np.linalg.norm(xyz[:,[1,2]], axis=1)
+#     vzx = np.linalg.norm(xyz[:,[2,1]], axis=1)
+#     vq = np.quantile(v, q)
+#     vxyq = np.quantile(vxy, q)
+#     vyzq = np.quantile(vyz, q)
+#     vzxq = np.quantile(vzx, q)
+#     return (vq, vxyq, vyzq, vzxq)
+
+
+def quantile_features(xyz):
+    vxy = np.linalg.norm(xyz[:,[0,1]], axis=1)
+    vzx = np.linalg.norm(xyz[:,[2,1]], axis=1)
+    vxyq10 = np.quantile(vxy, 0.1)
+    vzxq30 = np.quantile(vzx, 0.3)
+    vxyq60 = np.quantile(vxy, 0.6)
+    return [vxyq10, vzxq30, vxyq60]
+
+
+def catch22_features(xyz):
+    xyz = xyz.astype('f8')
+    v = np.linalg.norm(xyz, axis=1)
+    vxy = np.linalg.norm(xyz[:,[0,1]], axis=1)
+    x, y, z = xyz.T
+    v, x, y, z = list(v), list(x), list(y), list(z)
+    vxy = list(vxy)
+    feats = []
+    feats.append(catch22.SB_MotifThree_quantile_hh(v))
+    feats.append(catch22.MD_hrv_classic_pnn40(y))
+    feats.append(catch22.PD_PeriodicityWang_th0_01(x))
+    feats.append(catch22.PD_PeriodicityWang_th0_01(v))
+    feats.append(catch22.DN_OutlierInclude_p_001_mdrmd(v))
+    feats.append(catch22.MD_hrv_classic_pnn40(vxy))
+    feats.append(catch22.SC_FluctAnal_2_rsrangefit_50_1_logi_prop_r1(v))
+    return feats
 
 
 def timer(msg):
@@ -470,6 +530,38 @@ def mad(xyz, n=3000, lognormalize=True):
     return res
 
 
+def impute_nan2(x):
+    '''
+    Impute a 2D array in the vertical direction by random substitution, e.g
+
+    Input:
+    [[0,   1,   2, nan,   3],
+     [1, nan, nan,   4,   7],
+     [3,   4,   5,   5, nan]]
+
+    Output:  (one of many possibilities)
+    [[0,   1,   2,   5,   3],
+     [1,   1,   2,   4,   7],
+     [3,   4,   5,   5,   7]]
+
+    The imputation is greedy in the sense that each row is used to fill in
+    the imputed row as much as possible before jumping to the next row.
+    '''
+    x_new = x.copy()
+    n = x.shape[0]
+    for i in range(n):
+        xi = x_new[i]
+        js = np.random.permutation(n)
+        for j in js:
+            if j == i: continue
+            mask = np.any(~np.isfinite(xi), axis=-1)
+            if not mask.any(): break
+            xj = x[j]
+            xi[mask] = xj[mask]
+
+    return x_new
+
+
 def process(
     npypath, impute=False, detect_nonwear=False,
     start_of_day=10*HOUR, num_days=7,
@@ -547,61 +639,64 @@ def process(
         print(f"{k}: {v}")
     print("----------------\n")
 
-    xyz_mad = mad(xyz)
-
-    # Align days to start on Monday
-    day_length = xyz_mad.shape[0] // num_days
-    xyz_mad = np.concatenate((xyz_mad[(weekday*day_length):], xyz_mad[:(weekday*day_length)]))
-
-    np.save(outfile, xyz_mad)
-
     # with open(outfile, 'wb') as f:
     #     print(f"saving to {outfile}")
     #     pickle.dump({'info':info, 'xyz':xyz}, f)
 
-    # X = random_intervals(xyz)
+    # Group into intervals of 30 secs
+    xyz = xyz.reshape(-1,3000,3)
 
-    # if transpose:
-    #     X = np.transpose(X, axes=(0,2,1))
+    # extractor = Extractor(fft3d=False)
+    # X_feats = []
+    # for i in tqdm(range(len(xyz))):
+    # # for i in range(len(xyz)):
+    #     base_feats = extractor.extract(xyz[i])
+    #     base_feats = base_feats[[38, 55, 9, 84, 66]]
+    #     quantile_feats = quantile_features(xyz[i])
+    #     catch22_feats = catch22_features(xyz[i])
+    #     feats = np.concatenate((base_feats, quantile_feats, catch22_feats))
+    #     X_feats.append(feats)
+    # X_feats = np.stack(X_feats)
 
-    # np.save(outfile+'_intervals', X)
+    #!hack
+    # xyz = xyz[:5000]
 
-    # # NFEATS = 65
-    # NFEATS = 125
-    # IFEAT = 54  # MAD
-    # extractor = Extractor()
-    # # Group into intervals of 30 secs
-    # xyz = xyz.reshape(-1,3000,3)
-    # # # # Group into intervals of 10 secs
-    # # xyz = xyz.reshape(-1,1000,3)
-    # # Transpose to make it axes-first
-    # xyz = np.transpose(xyz, axes=(0,2,1))
+    X_feats_catch22 = []
+    for i in tqdm(range(len(xyz))):
+        if np.isfinite(xyz[i]).all():
+            feats = catch22_features(xyz[i])
+        else:
+            feats = [np.nan]*7
+        X_feats_catch22.append(feats)
+    X_feats_catch22 = np.stack(X_feats_catch22).astype(XYZ_DTYPE)
 
-    # # Feature extraction
-    # xyz_feats = np.empty((xyz.shape[0], NFEATS), dtype=XYZ_DTYPE)
-    # for i, x in enumerate(xyz):
-    #     xyz_feats[i] = extractor.extract(x).astype(XYZ_DTYPE)
-    # # xyz_feats = np.empty(xyz.shape[0], dtype=XYZ_DTYPE)
-    # # for i, x in enumerate(xyz):
-    # #     xyz_feats[i] = extractor.extract(x).astype(XYZ_DTYPE)[IFEAT]
+    extractor = Extractor(fft3d=False)
+    X_feats_base = []
+    for i in tqdm(range(len(xyz))):
+        if np.isfinite(xyz[i]).all():
+            base_feats = extractor.extract(xyz[i])
+            base_feats = base_feats[[38, 55, 9, 84, 66]]
+            quantile_feats = quantile_features(xyz[i])
+            feats = np.concatenate((base_feats, quantile_feats))
+        else:
+            feats = [np.nan]*8
+        X_feats_base.append(feats)
+    X_feats_base = np.stack(X_feats_base).astype(XYZ_DTYPE)
+    Extractor.shutdown()
+    
+    X_feats = np.concatenate((X_feats_base, X_feats_catch22), axis=1)
 
-    # del xyz
-
-    # # Align days to start on Monday
-    # day_length = xyz_feats.shape[0] // num_days
-    # xyz_feats = np.concatenate((xyz_feats[(weekday*day_length):], xyz_feats[:(weekday*day_length)]))
+    # Align days to start on Monday
+    day_length = X_feats.shape[0] // num_days
+    X_feats = np.concatenate((X_feats[(weekday*day_length):], X_feats[:(weekday*day_length)]))
 
     # # Finally, transpose to make it feature-first
     # xyz_feats = np.transpose(xyz_feats, axes=(1,0))
 
     # # Minimal checks
-    # assert not np.isnan(xyz_feats).any(), 'NaN found during feature extraction'
-    # assert not np.isinf(xyz_feats).any(), 'Inf found during feature extraction'
+    # assert np.isfinite(xyz_feats).all(), 'NaN or Inf found during feature extraction'
 
-    # np.save(outfile+'_feats', xyz_feats)
-
-    # if compress:
-    #     xyz = blosc_compress(xyz)
+    np.save(outfile, X_feats)
 
 
 

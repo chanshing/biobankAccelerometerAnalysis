@@ -11,7 +11,7 @@ import java.util.zip.GZIPOutputStream;
 
 public class NpyWriter {
 
-    private static final Boolean COMPRESS = true;
+    private static final Boolean COMPRESS = false;
     private String outputFile;
 	private File file;
     private RandomAccessFile raf;

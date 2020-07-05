@@ -359,8 +359,22 @@ def main():
 
     #!npyproc
     if args.npyproc:
-        npyproc.process(args.npyFile+'.gz', impute=False, detect_nonwear=True, outfile=args.npyFile.replace('.npy', '_MAD.npy'))
-        os.remove(args.npyFile+'.gz')
+        @atexit.register
+        def deleteNpy():
+            try:
+                if os.path.exists(args.npyFile):
+                    os.remove(args.npyFile)
+                if os.path.exists(args.npyFile+'.gz'):
+                    os.remove(args.npyFile+'.gz')
+            except OSError:
+                accelerometer.accUtils.toScreen('Could not delete npy intermediate file')
+
+        npyproc.process(
+            args.npyFile, 
+            impute=False, 
+            detect_nonwear=True, 
+            outfile=args.npyFile.replace('.npy', '_feats.npy'),
+        )
 
     # Summarise epoch
     epochData, labels = accelerometer.summariseEpoch.getActivitySummary(
