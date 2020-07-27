@@ -16,7 +16,8 @@ import blosc
 from numba import jit, guvectorize
 import jpype
 import jpype.imports
-import catch22
+from scipy.signal import butter, sosfiltfilt, welch
+from scipy.stats import entropy, median_abs_deviation
 from catch22 import catch22_all
 from tqdm.auto import tqdm
 
@@ -45,85 +46,105 @@ X_FIELD, Y_FIELD, Z_FIELD = 'x', 'y', 'z'
 TIME_DTYPE = 'i8'
 XYZ_DTYPE = 'f4'
 DATA_DTYPE = np.dtype([('time', 'i8'), ('x', 'f4'), ('y', 'f4'), ('z', 'f4')])
-DEVICE_SAMPLE_HZ = 100
-
-class Extractor():
-    ''' A wrapper of the Java class FeatureExtractor using the JPype package.
-    It starts a Java Virtual Machine, instantiates FeatureExtractor, and
-    implements 'extract' method to handle numpy arrays.
-    '''
-    def __init__(self, basic=True, sanDiego=True, mad=True, unilever=True, fft3d=True):
-        Extractor.start()
-        self.java_extractor = jpype.JClass('FeatureExtractor')
-        self.basic = basic
-        self.sanDiego = sanDiego
-        self.mad = mad
-        self.unilever = unilever
-        self.fft3d = fft3d
-
-    def extract(self, xyz):
-        xyz = xyz.astype('f8')
-        xArray, yArray, zArray = xyz.T
-        xArray = jpype.JArray(jpype.JDouble, 1)(xArray)
-        yArray = jpype.JArray(jpype.JDouble, 1)(yArray)
-        zArray = jpype.JArray(jpype.JDouble, 1)(zArray)
-        return np.asarray(self.java_extractor.extract(
-            xArray, yArray, zArray, DEVICE_SAMPLE_HZ,
-            self.basic, self.sanDiego, self.mad, self.unilever, self.fft3d
-        ))
-
-    @staticmethod
-    def shutdown():
-    # Shut down Java Virtual Machine
-        jpype.shutdownJVM()
-
-    @staticmethod
-    def start():
-    # Start Java Virtual Machine
-        if not jpype.isJVMStarted():
-            jpype.addClassPath("java_feature_extractor")
-            jpype.addClassPath("java_feature_extractor/JTransforms-3.1-with-dependencies.jar")
-            jpype.startJVM("-XX:ParallelGCThreads=1", convertStrings=False)
+DEVICE_HZ = 100
 
 
-# def quantile_features(xyz):
-#     q = np.arange(.1, 1, .1)
-#     v = np.linalg.norm(xyz, axis=1)
-#     vxy = np.linalg.norm(xyz[:,[0,1]], axis=1)
-#     vyz = np.linalg.norm(xyz[:,[1,2]], axis=1)
-#     vzx = np.linalg.norm(xyz[:,[2,1]], axis=1)
-#     vq = np.quantile(v, q)
-#     vxyq = np.quantile(vxy, q)
-#     vyzq = np.quantile(vyz, q)
-#     vzxq = np.quantile(vzx, q)
-#     return (vq, vxyq, vyzq, vzxq)
+def time_features(xyz):
+    xyzG = butter_lowpass_filter(xyz, 0.5, DEVICE_HZ, order=4, axis=0)  # gravity approximation
+    xyz = butter_lowpass_filter(xyz, 30, DEVICE_HZ, order=4, axis=0)  # remove noise
+    x, y, z = xyz.T
+    v = np.linalg.norm(xyz, axis=1)
+    xMean, yMean, zMean = np.abs(np.mean(x)), np.abs(np.mean(y)), np.abs(np.mean(z))
+    xRange, yRange, zRange = np.ptp(x), np.ptp(y), np.ptp(z)
+    xStd, yStd, zStd = np.std(x), np.std(y), np.std(z)
+    xyCov, yzCov, zxCov = np.abs(np.cov(x,y)[0,1]), np.abs(np.cov(y,z)[0,1]), np.abs(np.cov(z,x)[0,1])
+    xCorr = np.dot(x[DEVICE_HZ:], x[:-DEVICE_HZ])
+    yCorr = np.dot(y[DEVICE_HZ:], y[:-DEVICE_HZ])
+    zCorr = np.dot(z[DEVICE_HZ:], z[:-DEVICE_HZ])
+    vMean, vRange, vStd = np.mean(v), np.ptp(v), np.std(v)
+    vCorr = np.dot(v[DEVICE_HZ:], v[:-DEVICE_HZ])
+    enmoTrunc = np.mean(np.maximum(v - 1, 0))
+    mad = median_abs_deviation(v)
+
+    # Gravity-removed features (San Diego features)
+    xyz = xyz - xyzG  # gravity removed
+    x, y, z = xyz.T
+    v = np.linalg.norm(xyz, axis=1)
+    sanMean = np.mean(v)
+    sanStd = np.std(v)
+    sanCoefVar = sanStd / (sanMean + 1e-8)
+    sanMin, san25thp, sanMedian, san75thp, sanMax = np.percentile(v, (0,25,50,75,100))
+    sanXYCorr, sanYZCorr, sanZXCorr = np.abs(np.dot(x, y)), np.abs(np.dot(y, z)), np.abs(np.dot(z, x))
+    sanCorr = np.dot(v[DEVICE_HZ:], v[:-DEVICE_HZ])
+
+    return np.asarray([
+        # xMean, yMean, zMean,
+        # xRange, yRange, zRange, 
+        # xStd, yStd, zStd, 
+        # xyCov, yzCov, zxCov,
+        # xCorr, yCorr, zCorr, 
+        vMean, vRange, vStd, vCorr, 
+        enmoTrunc, mad,
+        sanMean, sanStd, sanCoefVar, 
+        sanMedian, sanMin, sanMax, san25thp, san75thp, 
+        # sanXYCorr, sanYZCorr, sanZXCorr, 
+        sanCorr
+    ]).astype('f4')
 
 
-def quantile_features(xyz):
-    vxy = np.linalg.norm(xyz[:,[0,1]], axis=1)
-    vzx = np.linalg.norm(xyz[:,[2,1]], axis=1)
-    vxyq10 = np.quantile(vxy, 0.1)
-    vzxq30 = np.quantile(vzx, 0.3)
-    vxyq60 = np.quantile(vxy, 0.6)
-    return [vxyq10, vzxq30, vxyq60]
+def frequency_features(xyz):
+    v = np.linalg.norm(xyz, axis=1)
+    # Spectrum
+    freqs, powers = welch(v, fs=DEVICE_HZ, nperseg=10*DEVICE_HZ)
+    # Spectral entropy
+    h = entropy(powers)
+    # Total power
+    totalp = np.sum(powers)
+    # Dominant frequency
+    fmax, pmax = get_dominant_frequency(freqs, powers)
+    # Dominant frequency between 0.3-3Hz
+    mask = (0.3 <= freqs) & (freqs <= 3)
+    f33, p33 = get_dominant_frequency(freqs[mask], powers[mask])
+    # Dominant between 0.3-15Hz
+    mask = (0.3 <= freqs) & (freqs <= 15)
+    f315_1, p315_1 = get_dominant_frequency(freqs[mask], powers[mask])
+    # Second dominant between 0.3-15Hz
+    mask = mask | ~(freqs==f315_1)
+    f315_2, p315_2 = get_dominant_frequency(freqs[mask], powers[mask])
+    # Dominant between 0.6-2.5Hz
+    mask = (0.6 <= freqs) & (freqs <= 2.5)
+    f625, p625 = get_dominant_frequency(freqs[mask], powers[mask])
+    # Powers for frequencies 0Hz, 1Hz, ..., 15Hz
+    _, powers15 = welch(v, fs=DEVICE_HZ, nperseg=DEVICE_HZ)
+    powers15 = powers15[:16]
+    feats = np.concatenate((
+        np.asarray([h, totalp, fmax, pmax, f33, p33, f315_1, p315_1, f315_2, p315_2, f625, p625]), powers15
+    )).astype('f4')
+    return feats
 
 
 def catch22_features(xyz):
-    xyz = xyz.astype('f8')
     v = np.linalg.norm(xyz, axis=1)
-    vxy = np.linalg.norm(xyz[:,[0,1]], axis=1)
-    x, y, z = xyz.T
-    v, x, y, z = list(v), list(x), list(y), list(z)
-    vxy = list(vxy)
-    feats = []
-    feats.append(catch22.SB_MotifThree_quantile_hh(v))
-    feats.append(catch22.MD_hrv_classic_pnn40(y))
-    feats.append(catch22.PD_PeriodicityWang_th0_01(x))
-    feats.append(catch22.PD_PeriodicityWang_th0_01(v))
-    feats.append(catch22.DN_OutlierInclude_p_001_mdrmd(v))
-    feats.append(catch22.MD_hrv_classic_pnn40(vxy))
-    feats.append(catch22.SC_FluctAnal_2_rsrangefit_50_1_logi_prop_r1(v))
+    feats = np.asarray(catch22_all(v)['values']).astype('f4')
     return feats
+
+
+def get_dominant_frequency(freqs, powers):
+    i = np.argmax(powers)
+    return freqs[i], powers[i]
+
+
+def butter_coefs(cutoff, fs, order=2):
+    nyq = 0.5 * fs
+    normal_cutoff = cutoff / nyq
+    sos = butter(order, normal_cutoff, btype='low', analog=False, output='sos')
+    return sos
+
+
+def butter_lowpass_filter(data, cutoff, fs, order=4, axis=-1):
+    sos = butter_coefs(cutoff, fs, order=order)
+    y = sosfiltfilt(sos, data, axis=axis)
+    return y
 
 
 def timer(msg):
@@ -341,8 +362,6 @@ def resolve_daylight_saving_time(t, zone='Europe/London'):
 @timer(msg="loading data... ")
 def load_xyz(npypath, start_of_day, num_days=7, fill_value=np.nan):
     data = load_data(npypath)
-    # data['time'] = data['time'] + (170)*24*60*60*SEC_IN_NANOS  #! debug  (check DST October)
-    # data['time'] = data['time'] - (40)*24*60*60*SEC_IN_NANOS  #! debug  (check DST March)
     t, mask, offset = resolve_daylight_saving_time(data['time'])
     t = t[mask]
     t = round_nanos2centis(t)
@@ -514,22 +533,6 @@ def random_intervals(xyz, length=3000, size=1000):
     return intervals
 
 
-def mad(xyz, n=3000, lognormalize=True):
-    # empirical values based on 1k subjects
-    LOG_MEAN = -4.2166924
-    LOG_STD = 1.5712029
-    SLEEP_CUTOFF = 0.0061321235
-    LOG_SLEEP_CUTOFF = -5.094214177927501
-    xyz = xyz.reshape(-1,n,xyz.shape[-1])
-    v = np.linalg.norm(xyz, axis=-1)
-    res = v - np.mean(v, -1, keepdims=True)
-    res = np.abs(res).mean(-1)
-    if lognormalize:
-        res = np.log(res+1e-8)
-        res = (res - LOG_MEAN) / LOG_STD
-    return res
-
-
 def impute_nan2(x):
     '''
     Impute a 2D array in the vertical direction by random substitution, e.g
@@ -598,7 +601,7 @@ def process(
         imputed_times_durations = []
 
     if resample_hz is not None:
-        scale = resample_hz / DEVICE_SAMPLE_HZ
+        scale = resample_hz / DEVICE_HZ
         if resample_method == 'fft':
             xyz = resample_xyz(xyz, num=int(len(xyz)*scale))
         elif resample_method == 'linear':
@@ -629,7 +632,7 @@ def process(
         'imputed': imputed_times_durations,
         'resample_hz': resample_hz,
         'resample_method': resample_method,
-        'device_hz': DEVICE_SAMPLE_HZ,
+        'device_hz': DEVICE_HZ,
         'month': month,
         'weekday': weekday,
     }
@@ -646,55 +649,23 @@ def process(
     # Group into intervals of 30 secs
     xyz = xyz.reshape(-1,3000,3)
 
-    # extractor = Extractor(fft3d=False)
-    # X_feats = []
-    # for i in tqdm(range(len(xyz))):
-    # # for i in range(len(xyz)):
-    #     base_feats = extractor.extract(xyz[i])
-    #     base_feats = base_feats[[38, 55, 9, 84, 66]]
-    #     quantile_feats = quantile_features(xyz[i])
-    #     catch22_feats = catch22_features(xyz[i])
-    #     feats = np.concatenate((base_feats, quantile_feats, catch22_feats))
-    #     X_feats.append(feats)
-    # X_feats = np.stack(X_feats)
-
-    #!hack
-    # xyz = xyz[:5000]
-
-    X_feats_catch22 = []
+    X_feats = []
     for i in tqdm(range(len(xyz))):
         if np.isfinite(xyz[i]).all():
-            feats = catch22_features(xyz[i])
+            time_feats = time_features(xyz[i])
+            frequency_feats = frequency_features(xyz[i])
+            catch22_feats = catch22_features(xyz[i])
+            feats = np.concatenate((
+                time_feats, frequency_feats, catch22_feats
+            )).astype('f4')
         else:
-            feats = [np.nan]*7
-        X_feats_catch22.append(feats)
-    X_feats_catch22 = np.stack(X_feats_catch22).astype(XYZ_DTYPE)
-
-    extractor = Extractor(fft3d=False)
-    X_feats_base = []
-    for i in tqdm(range(len(xyz))):
-        if np.isfinite(xyz[i]).all():
-            base_feats = extractor.extract(xyz[i])
-            base_feats = base_feats[[38, 55, 9, 84, 66]]
-            quantile_feats = quantile_features(xyz[i])
-            feats = np.concatenate((base_feats, quantile_feats))
-        else:
-            feats = [np.nan]*8
-        X_feats_base.append(feats)
-    X_feats_base = np.stack(X_feats_base).astype(XYZ_DTYPE)
-    Extractor.shutdown()
-    
-    X_feats = np.concatenate((X_feats_base, X_feats_catch22), axis=1)
+            feats = np.asarray([np.nan]*65).astype('f4')
+        X_feats.append(feats)
+    X_feats = np.stack(X_feats).astype('f4')
 
     # Align days to start on Monday
     day_length = X_feats.shape[0] // num_days
     X_feats = np.concatenate((X_feats[(weekday*day_length):], X_feats[:(weekday*day_length)]))
-
-    # # Finally, transpose to make it feature-first
-    # xyz_feats = np.transpose(xyz_feats, axes=(1,0))
-
-    # # Minimal checks
-    # assert np.isfinite(xyz_feats).all(), 'NaN or Inf found during feature extraction'
 
     np.save(outfile, X_feats)
 
