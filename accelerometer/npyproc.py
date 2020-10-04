@@ -79,15 +79,15 @@ def time_features(xyz):
 
     return np.asarray([
         # xMean, yMean, zMean,
-        # xRange, yRange, zRange, 
-        # xStd, yStd, zStd, 
+        # xRange, yRange, zRange,
+        # xStd, yStd, zStd,
         # xyCov, yzCov, zxCov,
-        # xCorr, yCorr, zCorr, 
-        vMean, vRange, vStd, vCorr, 
+        # xCorr, yCorr, zCorr,
+        vMean, vRange, vStd, vCorr,
         enmoTrunc, mad,
-        sanMean, sanStd, sanCoefVar, 
-        sanMedian, sanMin, sanMax, san25thp, san75thp, 
-        # sanXYCorr, sanYZCorr, sanZXCorr, 
+        sanMean, sanStd, sanCoefVar,
+        sanMedian, sanMin, sanMax, san25thp, san75thp,
+        # sanXYCorr, sanYZCorr, sanZXCorr,
         sanCorr
     ]).astype('f4')
 
@@ -409,9 +409,7 @@ def flag_nonwear(
     nonwear_locs = []
     nonwear_counts = []
     for i,j in edges:
-        x = xyz[:,0][i:j]
-        y = xyz[:,1][i:j]
-        z = xyz[:,2][i:j]
+        x, y, z = xyz[i:j].T
         x_std = np.empty_like(x)
         y_std = np.empty_like(y)
         z_std = np.empty_like(z)
@@ -428,9 +426,7 @@ def flag_nonwear(
 
     if inplace:
         for loc, count in zip(nonwear_locs, nonwear_counts):
-            xyz[:,0][loc:loc+count] = fill_value
-            xyz[:,1][loc:loc+count] = fill_value
-            xyz[:,2][loc:loc+count] = fill_value
+            xyz[loc:loc+count] = fill_value
 
     return nonwear_locs, nonwear_counts
 
