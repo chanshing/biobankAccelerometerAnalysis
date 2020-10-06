@@ -179,7 +179,7 @@ def blosc_decompress(x, size, dtype, shape=None):
     return x_.reshape(shape)
 
 
-def load_data(npypath, *args, **kwargs):
+def load_npy(npypath, *args, **kwargs):
     if npypath.endswith('.npy.gz'):
         data = np.load(gzip.GzipFile(npypath, 'rb'), *args, **kwargs)
     elif npypath.endswith('.npy'):
@@ -361,9 +361,11 @@ def resolve_daylight_saving_time(t, zone='Europe/London'):
 
 @timer(msg="loading data... ")
 def load_xyz(npypath, start_of_day, num_days=7, fill_value=np.nan):
-    data = load_data(npypath)
-    t, mask, offset = resolve_daylight_saving_time(data['time'])
-    t = t[mask]
+    data = load_npy(npypath)
+    # t, mask, offset = resolve_daylight_saving_time(data['time'])
+    # t = t[mask]
+    t = data['time']
+    offset = 0
     t = round_nanos2centis(t)
     start_date = floor_day(t[0]).astype(np.int)
     # end_date = floor_day(t[-1]).astype(np.int)
@@ -372,7 +374,7 @@ def load_xyz(npypath, start_of_day, num_days=7, fill_value=np.nan):
     n = end_date - start_date + DAY
     xyz = np.full((n, 3), fill_value=fill_value, dtype=XYZ_DTYPE)
     xyz[tidxs] = repack_fields(
-        data[[X_FIELD, Y_FIELD, Z_FIELD]][mask]).view(XYZ_DTYPE).reshape(len(tidxs), -1)
+        data[[X_FIELD, Y_FIELD, Z_FIELD]]).view(XYZ_DTYPE).reshape(len(tidxs), -1)
     xyz = xyz[start_of_day:-(DAY-start_of_day)]  # trim ends at start of day
     start_time, end_time = start_date + start_of_day, end_date + start_of_day
     # ndays = (end_time - start_time) // DAY
@@ -381,7 +383,7 @@ def load_xyz(npypath, start_of_day, num_days=7, fill_value=np.nan):
 
 @timer(msg="loading data... ")
 def load_xyz2(npypath, fill_value=np.nan):
-    data = load_data(npypath)
+    data = load_npy(npypath)
     # t, mask, offset = resolve_daylight_saving_time(data['time'])
     # t = t[mask]
     offset = 0
